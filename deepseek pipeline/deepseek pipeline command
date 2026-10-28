@@ -1,0 +1,5 @@
+BRIDGE_ROOT=project_location python3 server.py
+
+
+
+
