@@ -587,4 +587,4 @@ Settings in `extension/content.js` (the `CFG` object):
 
 ## License
 
-Add your preferred license here (for example MIT).
+MIT license
