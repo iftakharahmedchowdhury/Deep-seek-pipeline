@@ -1,23 +1,26 @@
 # DeepSeek Local Bridge
 
-Give the **DeepSeek web chat** (`chat.deepseek.com`) hands on your own machine.
-
 DeepSeek's website can't touch your files or run commands. This project adds a
 small bridge so that it can: the model writes tool calls, a Chrome extension
 runs them on a tiny local server, and the results are pasted back into the chat
-automatically. The loop repeats until the task is done, which makes the web chat
-behave like a lightweight coding agent working inside one project folder.
+automatically. The loop repeats until the task is done, so the web chat behaves
+like a coding agent working inside one project folder.
 
 - **Server:** Python standard library only, no `pip install` needed
 - **Extension:** Chrome / Chromium, Manifest V3
 - **No API key:** it drives the normal DeepSeek chat page
-- **Rate-limit aware:** paces its own messages so DeepSeek's "too frequent" error is avoided, and recovers if it still happens
-- **Sandboxed shell:** `run` commands cannot write outside the project or gain privileges (Linux)
+- **17 tools:** search, read, edit, move, run commands, and manage long-running processes
+- **End task button:** stops everything at once and stays stopped until you start again
+- **Safe chat switching:** opening another chat never re-runs its old tool calls
+- **Approval cards:** Allow / Allow all / Deny, right in the panel
+- **Long tasks:** hands the work over to a fresh chat automatically when the chat gets long
+- **Rate-limit aware:** paces its own messages so DeepSeek's "too frequent" error is avoided
+- **Sandboxed shell:** commands cannot write outside the project or gain privileges (Linux)
 
 > **Warning:** this lets an AI run shell commands and edit files on your
 > computer. Read the [Security model](#security-model) section before using it.
 
-Current version: **v0.4** (extension `0.4.0`). See the [version history](#version-history).
+Current version: **v0.5** (extension `0.5.0`). See the [version history](#version-history).
 
 ---
 
@@ -45,10 +48,10 @@ Four parts work together:
 
 | Part | File | Role |
 |------|------|------|
-| Content script | `extension/content.js` | Runs inside the DeepSeek page. Watches replies, finds tool calls, paces and sends results back, recovers from stalls. |
+| Content script | `extension/content.js` | Runs inside the DeepSeek page. Watches replies, finds tool calls, asks for approval, paces and sends results back, handles End task, chat switches and hand-off. |
 | Background worker | `extension/background.js` | Relays requests from the page to the local server, and owns the **send gate** shared by all DeepSeek tabs. |
 | Bridge server | `server.py` | Runs on `127.0.0.1`. Executes the tools and returns output. |
-| Shell guard | `bridge_guard.py` | Sandboxes every `run` command (kernel limits + command policy). |
+| Shell guard | `bridge_guard.py` | Sandboxes every shell command (kernel limits + command policy). |
 
 ### The loop
 
@@ -64,25 +67,26 @@ sequenceDiagram
     U->>D: Click "Insert protocol", type task, press Enter
     D-->>C: Reply contains one or more tool blocks (JSON)
     C->>C: Wait until streaming stops, parse every block
-    C->>U: Ask for confirmation (if not read-only)
+    C->>U: Approval card in the panel (if not read-only)
     C->>B: chrome.runtime.sendMessage({path, body}) for each call
     B->>S: POST /exec with X-Bridge-Token
-    S->>G: run only: policy scan, then sandboxed launcher
-    S->>S: Run the tool inside BRIDGE_ROOT
+    S->>G: shell tools only: policy scan, then sandboxed launcher
+    S->>S: Run the tool inside the workspace root
     S-->>B: {ok, output}
     B-->>C: result
     C->>B: Ask the send gate for a slot (not generating, minimum gap)
     C->>D: Paste ONE combined "[TOOL RESULT] ..." and press Enter
     C->>C: Verify DeepSeek accepted it (retry with backoff if not)
     D-->>C: Next reply (more tool calls or the final answer)
+    U->>C: End task: cancel everything, stay stopped
 ```
 
 ### Step by step
 
-1. **Protocol prompt.** The panel's **Insert protocol** button fills the chat box
-   with instructions: the available tools, the JSON format, batching, the
-   sandbox rules, and how to finish (`TASK_COMPLETE`). You add your task after it
-   and send.
+1. **Protocol prompt.** **Insert protocol** fills the chat box with instructions:
+   the workspace root, all tools with JSON examples, how to work (understand,
+   change in small steps, verify, finish with `TASK_COMPLETE`), the sandbox rules,
+   and your [project instructions](#project-instructions). You add your task after it and send.
 2. **Tool calls.** DeepSeek replies with one or more fenced blocks (up to 5 per
    reply), each like:
 
@@ -92,15 +96,15 @@ sequenceDiagram
    ```
    ````
 
-   Several independent calls can go in one reply (for example three `read_file`s);
-   a block may also contain several JSON objects or a JSON array.
+   Several independent calls can go in one reply; a block may also contain several
+   JSON objects or a JSON array.
 3. **Detect.** One timer loop (every second) watches a `MutationObserver`. When
    the page has been quiet for 1.8 s **and** DeepSeek is not generating, the newest
    reply is considered finished. It looks for `<pre>` blocks containing
    `"tool":` and parses every object in them.
-4. **Approve.** Read-only calls run silently. Anything that writes files or runs
-   a possibly-changing command shows a confirmation popup first (with the full
-   command text).
+4. **Approve.** Read-only calls run silently. Anything that writes or runs a
+   possibly-changing command shows an **approval card** in the panel with the full
+   command.
 5. **Execute.** Each call goes content script, then background worker, then
    `POST http://127.0.0.1:8765/exec` with the secret token. Calls in a reply run
    in order; a failing call skips the rest of that reply.
@@ -108,7 +112,7 @@ sequenceDiagram
    combined into **one** `[TOOL RESULT]` message. The extension asks the send
    gate for a slot, types the message into the chat box, presses Enter, and
    checks that DeepSeek really accepted it.
-7. **Repeat** until DeepSeek ends with `TASK_COMPLETE` or `NEED_USER_INPUT`.
+7. **Repeat** until DeepSeek ends with `TASK_COMPLETE` or `NEED_USER_INPUT`, or you press **End task**.
 
 ---
 
@@ -119,6 +123,7 @@ deepseek-pipeline/
 ├── README.md
 ├── command                          # example launch command
 └── files/
+    ├── start_bridge.sh              # convenience launcher: ./start_bridge.sh /path/to/project
     ├── server.py                    # local bridge server (stdlib only)
     ├── bridge_guard.py              # shell sandbox + command policy (stdlib only)
     ├── .bridge_token                # created on first run: your secret token
@@ -129,8 +134,7 @@ deepseek-pipeline/
         └── content.js               # runs on chat.deepseek.com, drives the loop
 ```
 
-Folders named `files_backup_*` next to `files/` are snapshots of earlier
-versions (v0.2, v0.3, v0.3.1).
+A `files/_backup_*` folder, if present, is a snapshot of an earlier version.
 
 `.bridge_token` is your secret. **Never commit it.** See [Security model](#security-model).
 
@@ -144,31 +148,36 @@ versions (v0.2, v0.3, v0.3.1).
   The **kernel shell sandbox needs Linux 5.13+ with Landlock enabled**; check with
   `cat /sys/kernel/security/lsm` (the list should contain `landlock`). Without it
   only the text policy applies and the server banner says so.
-- macOS is not tested with v0.4 (the kernel sandbox is Linux-only).
+- macOS is not tested with v0.5 (the kernel sandbox is Linux-only; the launcher skips it elsewhere).
 - Python 3.8+
 - Google Chrome or any Chromium browser (Brave, Edge, Chromium)
 - A DeepSeek account at <https://chat.deepseek.com>
 
 ### 1. Start the bridge server
 
-Point `BRIDGE_ROOT` at the project folder you want the AI to work in:
+Point it at the project folder you want the AI to work in:
 
 ```bash
 cd files
+./start_bridge.sh /path/to/your/project
+# or, without the helper script:
 BRIDGE_ROOT=/path/to/your/project python3 server.py
 ```
 
 On startup it prints:
 
 ```
+DeepSeek Local Bridge server v0.5.0
 Bridge root : /path/to/your/project
 Shell safety: no_new_privs + Landlock enforced (shell can only write to the allowed folders); writable: ...
+Instructions: AGENTS.md            (or: none - add AGENTS.md or .deepseek/instructions.md ...)
 Listening   : http://127.0.0.1:8765
 Token       : <random-token>   (also in files/.bridge_token)
 ```
 
-Check the `Shell safety` line: `Landlock enforced` is what you want. Copy the
-token; it is generated once and reused on later runs.
+Check the `Shell safety` line: `Landlock enforced` is what you want. The token is
+generated once and reused on every later start: **you do not need to restart the
+server to get it again**, it is always in `files/.bridge_token`.
 
 ### 2. Install the extension
 
@@ -178,73 +187,130 @@ token; it is generated once and reused on later runs.
 4. After **any** change to the extension files, press **Reload** on that page and
    refresh the DeepSeek tab
 
+**Load it only once.** If you keep several copies of this folder, make sure only one
+of them is enabled in `chrome://extensions` (remove the others). If two do load, the
+newest version wins and the rest shut themselves down, but a stale copy with an old
+token is a common source of confusion.
+
 ### 3. Connect
 
-1. Open <https://chat.deepseek.com>. A small **Local Bridge v0.4** panel appears
-   in the bottom-right corner.
-2. Paste the token into the **bridge token** field.
-3. Click **Insert protocol**. If it says "bridge unreachable or bad token", the
-   server isn't running or the token is wrong.
+1. Open <https://chat.deepseek.com>. A small **Local Bridge v0.5** panel appears
+   in the bottom-right corner (click its header to collapse it).
+2. Click **Token...** and paste the token. It is checked against the server
+   first and only saved if the server accepts it. This is needed **once**; it stays
+   saved when you switch chats or restart the server.
+3. The panel shows a dot and a line: **green** "connected - project/folder",
+   **red** "bridge server not reachable", **orange** "token rejected".
 
 ---
 
 ## Usage
 
-1. Click **Insert protocol**. The chat box fills with the tool instructions.
-   Do this in every **new** chat.
+1. In a **new** chat, click **Insert protocol**. The chat box fills with the instructions.
 2. Type your task after `My task:`, for example:
    *"Find where `Employee` is defined and explain how payroll is calculated."*
 3. Press **Enter** yourself. This starts the task and resets the step counters.
-4. Watch the panel status. DeepSeek reads files, runs searches, and (if you
-   approve) edits files, with no further input from you.
+4. Watch the panel. DeepSeek reads files, runs searches, and (after you approve)
+   edits files and runs commands, with no further input from you.
 5. The run ends when DeepSeek writes `TASK_COMPLETE`, asks you something with
-   `NEED_USER_INPUT`, or hits a limit (step limit, repeated sandbox refusals,
-   recovery failed). The status line says which.
+   `NEED_USER_INPUT`, you press **End task**, or a limit is hit (step limit, repeated
+   sandbox refusals, failed recovery). The status line says which.
 
-Keep the DeepSeek tab **visible**. Chrome slows timers in background tabs; the
-panel shows `TAB HIDDEN` when that happens.
+Keep the DeepSeek tab **visible**. Chrome slows timers in background tabs; the panel
+shows `TAB HIDDEN` when that happens, and the tab title shows "Approve?" if a card is waiting.
 
 ### The panel
 
 | Control | What it does |
 |---------|--------------|
-| bridge token | Stored in `chrome.storage.local` and sent with every request |
+| status dot + line | Connection to the bridge: connected / server not reachable / token rejected |
+| **Token...** | Paste the bridge token. Validated against the server, then saved. Shows `token ••••abcd` when one is saved. |
 | autopilot | Auto-continues when a reply stalls without a tool call |
-| auto-approve ALL | Skips every confirmation popup. **Risky**, leave it off (the sandbox still applies) |
-| Insert protocol | Puts the tool instructions into the chat box and arms the bridge |
-| Reset | Clears step counters and sandbox-refusal count, re-arms autopilot |
-| Copy log | Copies the recent event log and a state snapshot. **Send this when something stalls.** |
+| auto-handoff | Moves a long task to a fresh chat automatically (see [Long tasks](#long-tasks-and-hand-off)) |
+| auto-approve ALL | Skips every approval card. **Risky**, leave it off (the sandbox still applies) |
+| **Insert protocol** | Puts the tool instructions into the chat box and starts a new task |
+| **End task** | Stops everything immediately (see below) |
+| **Handoff** | Continue the current work in a fresh chat |
+| **Copy log** | Copies the recent event log and a state snapshot. **Send this when something stalls.** |
 | status line | Current state, `steps/60`, approximate chat size (`ctx~Nk` tokens), `TAB HIDDEN` if hidden |
+| approval card | Appears when a call needs your OK: **Allow**, **Allow all** (until the next task) or **Deny** |
+| activity list | The last tool calls with ✓ ok, ✗ error, ⛔ blocked/denied, ■ aborted, ↺ cached, ⏳ running |
 
 The panel turns **green** when done and **orange** on warnings.
 
----
+### End task
+
+One press and everything stops, immediately:
+
+- pending sends and retry countdowns are cancelled
+- an open approval card is closed (nothing runs)
+- the running command and any background processes are killed on the server
+- DeepSeek's own stop button is pressed if it is still generating
+- a message the extension had typed but not sent is removed from the box
+- the reply currently on screen is never executed, even if it finishes later
+
+It **stays stopped** (also across reloads of the reply, chat re-renders and retries)
+until **you** start something again: press Enter / click send in the chat, or **Insert protocol**.
+
+### Your own messages and chat switches
+
+- When you send a message yourself, anything automatic that was in flight is
+  cancelled, so it can never overwrite or double your message. Autopilot stays
+  quiet until DeepSeek makes its next tool call, so a plain answer to your question is not "nudged".
+- While you are typing something in the box, autopilot waits and never overwrites your draft.
+- **Switching to another chat** stops any running task there and starts clean:
+  old tool calls in that chat's history are recorded as already handled and are **never** run,
+  and autopilot is idle until you start a task in that chat.
+- A **new chat that just got its address** (after your first message) is recognised as the
+  same task, so nothing re-runs and nothing stops.
+
+### Long tasks and hand-off
+
+DeepSeek chats have a length limit, and every tool result adds to the chat. The panel
+shows an approximate size (`ctx~Nk`). With **auto-handoff** on, at roughly 70k tokens
+the next tool result carries a request: the model writes a **HANDOFF** (goal, what is done,
+files changed, current state, decisions, exact next steps, how to verify) between
+`HANDOFF_BEGIN` and `HANDOFF_END`. The extension saves it, opens a new chat, and fills the box
+with the protocol plus the handoff. You press **Enter** to continue the work there.
+A saved handoff expires after 6 hours. The **Handoff** button does the same on demand.
+The size is an estimate and DeepSeek's real limit is not documented, so the threshold is conservative.
 
 ## Tool reference
 
-DeepSeek calls these by emitting JSON objects in `tool` blocks (up to 5 per reply):
+DeepSeek calls these by emitting JSON objects in `tool` blocks (up to 5 per reply).
+"Asks" means an approval card appears first; read-only tools run silently.
 
-| Tool | Arguments | Description |
-|------|-----------|-------------|
-| `list_dir` | `path` | Lists a directory (folders first, max 500 entries) |
-| `read_file` | `path`, optional `start`, `end` | Reads a file by 1-based line range. The header shows the file's modified time. |
-| `run` | `cmd`, optional `cwd` | Runs a bash command inside the sandbox (60 s timeout) |
-| `write_file` | `path`, `content` | Creates or overwrites a file |
-| `append_file` | `path`, `content` | Appends to a file |
-| `replace_in_file` | `path`, `old`, `new` | Replaces text that must occur **exactly once** |
+| Tool | Arguments | Description | Approval |
+|------|-----------|-------------|----------|
+| `list_dir` | `path` | Lists a directory (folders first, max 500 entries) | no |
+| `read_file` | `path`, optional `start`, `end` | Reads a file by 1-based line range; the header shows the modified time. Files over 8 MB are refused. | no |
+| `read_multiple_files` | `paths` (up to 12), `max_lines` | Reads several files at once; one bad path does not hide the others | no |
+| `get_file_info` | `path` | Type, size, modified time, permissions, line count | no |
+| `search_files` | `pattern`, `path`, `max` | Finds files/folders by name (glob, case-insensitive) | no |
+| `search_content` | `pattern`, `path`, `glob`, `regex`, `ignore_case`, `context`, `max` | Searches text inside files like ripgrep. Literal by default, smart-case. Skips build/vendor/hidden folders and credential files. | no |
+| `write_file` | `path`, `content` | Creates or overwrites a file (creates folders, keeps a `.bak`) | asks |
+| `append_file` | `path`, `content` | Appends to a file | asks |
+| `replace_in_file` | `path`, `old`, `new`, optional `replace_all` | Replaces text that must occur **exactly once** (or all, with `replace_all`) | asks |
+| `create_directory` | `path` | Creates a folder (with parents) | asks |
+| `move_file` | `src`, `dst`, optional `overwrite` | Moves/renames inside the workspace; refuses to overwrite by default | asks |
+| `run` | `cmd`, optional `cwd`, `timeout` | Runs a bash command inside the sandbox (default 60 s, max 600 s). It has **no keyboard input** (stdin is closed). | asks unless read-only |
+| `start_process` | `cmd`, `cwd`, `wait` | Starts a long-running or interactive program; returns the pid and first output | asks unless read-only |
+| `read_process_output` | `pid`, `wait` | Returns only the NEW output since the last read, plus the status | no |
+| `interact_with_process` | `pid`, `input`, `wait` | Sends a line to the program's input and returns the reply | asks |
+| `kill_process` | `pid` | Stops a process the bridge started | no |
+| `list_processes` | none | Lists the background processes | no |
 
 Notes:
 
-- All paths are relative to `BRIDGE_ROOT`.
-- Add `"fresh": true` to any read-only call to bypass the [result cache](#result-cache).
+- All paths are relative to the workspace root; the file tools cannot leave it.
 - Before any write, the existing file is copied to `<name>.bak`.
 - Output is cut to `BRIDGE_MAX_OUT` characters (middle removed), so the model is
-  told to `grep` first and read small ranges. When several calls are batched, the
+  told to search first and read small ranges. When several calls are batched, the
   total is capped at about 20,000 characters.
-- Large files should be built with one `write_file` followed by several
-  `append_file` calls.
+- Add `"fresh": true` to a read-only call to bypass the [result cache](#result-cache).
 - Credential files (`.ssh`, `.aws`, `.gnupg`, `id_rsa`, browser profiles,
-  `/etc/shadow` ...) are never returned by `read_file` / `list_dir`.
+  `/etc/shadow` ...) are never returned by any read or search tool.
+- Background processes run under the same sandbox as `run`, at most 8 at once.
 
 ---
 
@@ -263,10 +329,11 @@ Two jobs:
 
 1. **Relay.** The content script sends `{type: "bridge", path, body}`; the worker
    reads the saved token and port from `chrome.storage.local`, does the `fetch`
-   to `http://127.0.0.1:<port><path>`, and returns the JSON. Doing the request
-   here instead of in the page avoids CORS and private-network restrictions, and
-   keeps the request's `Origin` as `chrome-extension://...`, which the server
-   relies on.
+   to `http://127.0.0.1:<port><path>`, and returns `{ok, status, data}`. Doing the
+   request here instead of in the page avoids CORS and private-network restrictions,
+   and keeps the request's `Origin` as `chrome-extension://...`, which the server
+   relies on. A request can carry its own token (used to validate a token before
+   saving it) and always has a timeout, so nothing can hang forever.
 2. **Send gate.** One shared lock for every DeepSeek tab: only one sender at a
    time (a lease that expires after 45 s so a crashed tab can't block it), a
    minimum gap between any two messages, and an **adaptive gap** that grows when
@@ -274,6 +341,15 @@ Two jobs:
    `chrome.storage.local`, so it survives the worker going to sleep.
 
 ### `content.js` (the autopilot)
+
+**One owner per page.** Only one copy of the extension may drive a page. A newer
+version wins; with equal versions the lowest id wins; older copies (v0.2-0.4) shut down
+when the page marker changes. A copy that is not the owner builds no panel and sends nothing.
+
+**Task control.** Everything automatic runs under a run id. **End task**, your own
+message, or a chat switch bumps it, and every in-flight step (waiting for a slot, a retry
+countdown, an approval, a tool result) notices and drops out. End task also sets a
+"halted" flag that blocks scanning, nudging and recovery until you start something.
 
 **Detecting finished replies.** A `MutationObserver` records the time of the last
 page change (ignoring the extension's own panel). A single loop ticks every
@@ -284,22 +360,25 @@ Both have a safety valve: if the page is frozen for 60 s / 20 s the signal is
 treated as a false positive, so a wrong guess can slow the loop but never block
 it forever.
 
-**Not re-running old calls.** Once the page has been quiet after loading, every
-tool call already on it is recorded as "seen", so reloading never replays
-history. Each reply is also remembered by a content signature together with the
-number of messages sent so far, so a re-render cannot run the same call twice.
+**Not re-running old calls.** Once the page has been quiet after loading (and again
+after every chat switch), every tool call already on it is recorded as "seen", so
+loading or switching chats never replays history. Each reply is also remembered by
+a content signature together with the number of messages sent so far, so a
+re-render cannot run the same call twice.
 
 **Approval rules** (`needsConfirm`):
 
 | Call | Behaviour |
 |------|-----------|
-| `list_dir`, `read_file` | Auto-run, unless the path looks sensitive |
-| `run` with a read-only command | Auto-run |
-| `run` with anything else | Confirmation popup (shows the full command) |
-| `write_file`, `append_file`, `replace_in_file` | Always confirmation popup |
-| Anything touching `.env`, `.ssh`, `.aws`, `.gnupg`, `.pem`, `id_rsa`, `credentials`, `secrets` | Always confirmation popup |
+| Read-only tools (`list_dir`, `read_file`, search tools, ...) | Auto-run, unless a path looks sensitive |
+| `run` / `start_process` with a read-only command | Auto-run |
+| `run` / `start_process` with anything else | Approval card (shows the full command) |
+| Write tools, `interact_with_process` | Always an approval card |
+| Anything touching `.env`, `.ssh`, `.aws`, `.gnupg`, `.pem`, `id_rsa`, `credentials`, `secrets` | Always an approval card |
 
-**Read-only shell detection.** A command skips the popup only if all of this
+"Allow all" on a card (or the auto-approve checkbox) silences further cards for the current task.
+
+**Read-only shell detection.** A command skips the approval card only if all of this
 holds:
 
 - Split on `; | || && &` and newlines (quote-aware), **every** segment starts with
@@ -324,19 +403,25 @@ holds:
 | 60 automatic sends in one task | Stops, leaves the message in the box for you to send |
 | Sandbox refused 3 actions in one task | Stops: the model keeps trying blocked actions |
 | Page silent for 45 s with nothing running | Stall watchdog (see below) |
+| You press End task | Everything stops until you start again |
 
-Pressing **Enter yourself** counts as a new task and resets the counters. Every
-tool result ends with a footer reminding the model that the output is data, not
-instructions.
+Pressing **Enter yourself** (or clicking send) counts as a new task and resets the counters.
+Every tool result ends with a footer reminding the model that the output is data, not instructions.
 
 ### Result cache
 
-Identical read-only calls (`read_file`, `list_dir`, read-only `run`) repeated
-within 20 seconds are answered from an in-page cache, and the reply says how old
-it is. The key is the exact call (including line ranges). Any write or
-non-read-only command clears the cache. Changes made **outside** the bridge
-(editor, git, another tab) are not seen, so the protocol tells the model to add
-`"fresh": true` when it suspects that.
+Identical read-only calls repeated within 20 seconds are answered from an in-page
+cache, and the reply says how old it is. The key is the exact call (including line
+ranges). Any write or non-read-only command clears the cache. Changes made
+**outside** the bridge (editor, git, another tab) are not seen, so the protocol tells
+the model to add `"fresh": true` when it suspects that.
+
+### The bridge token
+
+The token is never read from a form field. **Token...** asks for it in a prompt,
+checks it against the server, and saves it only if the server accepts it, so browser
+autofill or a password manager can no longer overwrite it with a wrong value.
+The panel header chip and the status line say whether the server is reachable and the token accepted.
 
 ---
 
@@ -360,14 +445,11 @@ fast or while a reply is still streaming. The extension prevents and handles it:
 - **Stall watchdog.** If autopilot is armed, the page has been silent for 45 s,
   nothing is running and there was no `TASK_COMPLETE`, it logs a diagnosis and
   recovers (clicks Retry/Regenerate if DeepSeek showed an error and offers that
-  button, otherwise sends a nudge or repair), up to
-  3 times. If DeepSeek says the conversation is too long it stops and tells you to
-  start a **new chat**.
+  button, otherwise sends a nudge or repair), up to 3 times. If DeepSeek says the
+  conversation is too long it stops and tells you to start a **new chat**.
 - **No silent hangs.** Calls to the background worker have timeouts, so a lost
   reply can no longer freeze the loop; a hung server returns `status=error` to the
   model instead of silence.
-- **Duplicate protection.** A reloaded or second copy of the script shuts itself
-  down; the send gate allows one sender at a time.
 - **Diagnostics.** The status line shows an approximate chat size and warns above
   60k tokens. **Copy log** exports the event log.
 
@@ -375,18 +457,20 @@ fast or while a reply is still streaming. The extension prevents and handles it:
 
 ## The server in detail
 
-`server.py` is a `ThreadingHTTPServer` bound to `127.0.0.1` only. It exposes two
+`server.py` is a `ThreadingHTTPServer` bound to `127.0.0.1` only. It exposes these
 POST endpoints:
 
 | Endpoint | Purpose |
 |----------|---------|
-| `/info` | Returns the workspace root, OS and shell-sandbox status (used for the handshake) |
+| `/ping` | No token needed. Lets the extension tell "server down" from "bad token". |
+| `/info` | Workspace root, OS, shell-sandbox status, version, tool list, project instructions |
 | `/exec` | Runs `{"tool": "...", ...}` and returns `{"ok": true, "output": "..."}` or `{"ok": false, "error": "..."}` |
+| `/cancel` | End task: kills the running command and the background processes |
 
 Every request is checked in this order:
 
 1. `Origin` header must **not** start with `http`. Normal web pages always send
-   one, so only the extension passes.
+   one, so only the extension passes (this applies to `/ping` too).
 2. `X-Bridge-Token` must match the secret token (constant-time compare).
 3. Body must be valid JSON.
 
@@ -394,17 +478,22 @@ Tool handling:
 
 - `safe()` resolves each path (following symlinks) and rejects anything outside
   `BRIDGE_ROOT` (unless `BRIDGE_ALLOW_OUTSIDE=1`).
-- `read_file` / `list_dir` refuse credential files.
-- `run` first checks a regex **denylist** (`rm -rf /`, `mkfs`, `dd if=`, fork
+- Read and search tools refuse credential files.
+- Shell tools first check a regex **denylist** (`rm -rf /`, `mkfs`, `dd if=`, fork
   bombs, shutdown/reboot, `chmod -R 777 /`, `curl | sh`), then the
-  [command policy](#shell-sandbox), then starts the command through the kernel
-  sandbox launcher with `TMPDIR` set to `.scratch/`. It runs in its own process
-  group; on timeout the whole group is killed.
-- Tool calls are serialized by a lock, so two tabs can never run commands at the
-  same time.
+  [command policy](#shell-sandbox), then start the command through the kernel
+  sandbox launcher with `TMPDIR` set to `.scratch/`, git prompts and pagers disabled.
+  Each runs in its own process group; on timeout or cancel the whole group is killed.
+- `run` gets an **empty stdin**: a command that waits for input gets end-of-file
+  instead of grabbing the terminal the server runs in.
+- Background processes (`start_process`) are buffered; `read_process_output` returns only new
+  output (prompts without a newline included) and the exit status.
+- Ordinary tool calls are serialized by a lock, so two tabs can never change files at the same time.
+  Process tools that wait for output are exempt, so End task always works.
 - Writers call `backup()` first, producing `file.bak`.
+- Search skips `node_modules`, `.venv`, `__pycache__`, build folders and hidden folders (`.git`, `.idea`, ...), but keeps `.github` and `.vscode`.
 - Output goes through `clip()` so very large results can't flood the chat.
-- Each completed call is logged with a timestamp.
+- Each completed call is logged with a timestamp; the server stops all child processes on exit.
 
 ---
 
@@ -415,8 +504,8 @@ The protections are layered, but none of them is a guarantee.
 
 ### Shell sandbox
 
-`run` is the only tool that can reach beyond the workspace, so it is sandboxed
-in two layers (`bridge_guard.py`):
+Shell tools (`run`, `start_process`) are the only tools that can reach beyond the workspace, so
+they are sandboxed in two layers (`bridge_guard.py`):
 
 1. **Kernel layer (cannot be talked around).** Every command starts through a
    launcher that sets `no_new_privs` (so `sudo`, `su`, `pkexec` and setuid
@@ -443,14 +532,14 @@ in two layers (`bridge_guard.py`):
 ### What protects you
 
 - Server listens on `127.0.0.1` only, not reachable from the network
-- Random secret token, stored with `chmod 600`
+- Random secret token, stored with `chmod 600`, validated before it is saved
 - Browser pages cannot call the server (requests with an `http(s)` Origin are refused)
 - File tools are confined to `BRIDGE_ROOT`
 - Shell commands cannot write outside the allowed folders or gain privileges (Linux)
-- Confirmation popup for writes and non-read-only commands
-- Sensitive-path detection forces a popup even for reads
+- Approval card for writes and non-read-only commands
+- Sensitive-path detection forces an approval even for reads
 - Automatic `.bak` backups before every write
-- Timeouts, output limits, a step limit per task
+- Timeouts, output limits, a step limit per task, and an End task button that really stops things
 
 ### What does NOT protect you
 
@@ -461,16 +550,17 @@ in two layers (`bridge_guard.py`):
 - The command **policy and denylist are best-effort**. A shell can always do more
   than a list of patterns can anticipate; the kernel layer is the real boundary,
   and it exists only on Linux with Landlock. Without it the server banner says so
-  (set `BRIDGE_REQUIRE_LANDLOCK=1` to refuse `run` in that case).
+  (set `BRIDGE_REQUIRE_LANDLOCK=1` to refuse shell commands in that case).
 - **Prompt injection:** a file or command output could contain text trying to
   steer the model. The protocol tells the model to treat tool output as data, but
-  that is a request, not an enforcement.
-- "auto-approve ALL" removes the popup completely (the sandbox still applies).
+  that is a request, not an enforcement. The same applies to project instructions: they are
+  sent as instructions, so only keep text there that you trust.
+- "auto-approve ALL" and "Allow all" remove the approval cards (the sandbox still applies).
 - `BRIDGE_UNSAFE_SHELL=1` switches the whole shell sandbox off.
 
 ### Recommendations
 
-- Keep the confirmation popups on (leave "auto-approve ALL" unchecked)
+- Keep the approval cards on (leave "auto-approve ALL" unchecked)
 - Point `BRIDGE_ROOT` at one project, never at `~` or `/`
 - Use version control so you can review every change with `git diff`
 - Don't run it on a folder containing secrets
@@ -479,11 +569,12 @@ in two layers (`bridge_guard.py`):
   ```gitignore
   files/.bridge_token
   files/.scratch/
+  files/_backup_*/
   *.bak
   ```
 
   If a token was ever committed, delete `.bridge_token` and restart the server to
-  generate a new one.
+  generate a new one (then use **Token...** once).
 
 ---
 
@@ -495,11 +586,14 @@ Environment variables for `server.py`:
 |----------|---------|---------|
 | `BRIDGE_ROOT` | current directory | Workspace root the AI may work in |
 | `BRIDGE_PORT` | `8765` | Port to listen on |
-| `BRIDGE_TIMEOUT` | `60` | Seconds before a command is killed |
+| `BRIDGE_TIMEOUT` | `60` | Default seconds before a `run` command is killed |
+| `BRIDGE_TIMEOUT_MAX` | `600` | Largest timeout a `run` call may ask for |
 | `BRIDGE_MAX_OUT` | `12000` | Max characters returned per tool call |
+| `BRIDGE_TOKEN` | unset | Use this token instead of the one in `files/.bridge_token` |
+| `BRIDGE_INSTRUCTIONS_MAX` | `6000` | Max characters of project instructions sent to the model |
 | `BRIDGE_ALLOW_OUTSIDE` | unset | Set to `1` to let file tools leave the root |
-| `BRIDGE_WRITE_ALLOW` | unset | Extra folders `run` may write to, separated by `:` (for example `/tmp`) |
-| `BRIDGE_REQUIRE_LANDLOCK` | unset | Set to `1` to refuse `run` when the kernel sandbox is unavailable |
+| `BRIDGE_WRITE_ALLOW` | unset | Extra folders shell commands may write to, separated by `:` (for example `/tmp`) |
+| `BRIDGE_REQUIRE_LANDLOCK` | unset | Set to `1` to refuse shell commands when the kernel sandbox is unavailable |
 | `BRIDGE_UNSAFE_SHELL` | unset | Set to `1` to switch the shell sandbox and policy **off** (not recommended) |
 
 Example:
@@ -535,6 +629,9 @@ Settings in `extension/content.js` (the `CFG` object):
 | `stallMs` / `maxStallRecoveries` | `45000` / `3` | Silence before the watchdog acts, and how many recoveries it tries |
 | `maxPolicyBlocks` | `3` | Sandbox refusals in one task before autopilot stops |
 | `ctxWarnTokens` | `60000` | Chat size (approximate tokens) that triggers a warning |
+| `ctxHandoffTokens` | `70000` | Chat size at which auto-handoff asks the model for a handoff |
+| `handoffMaxAgeMs` | 6 hours | A saved handoff older than this is ignored |
+| `connectEveryMs` | `20000` | How often the connection chip is refreshed |
 
 ---
 
@@ -542,15 +639,22 @@ Settings in `extension/content.js` (the `CFG` object):
 
 | Problem | Likely cause / fix |
 |---------|--------------------|
-| "bridge unreachable or bad token" | Server not running, wrong token, or wrong port. Re-copy the token from the terminal or `files/.bridge_token`. |
-| Nothing happens after a tool block | Server not running, token missing, extension not reloaded, or DeepSeek changed its page (update `CFG.assistantMsg` / `CFG.input`). Press **Copy log**. |
+| Panel: "bridge server not reachable" (red) | The server is not running. Start `./start_bridge.sh /path/to/project`. |
+| Panel: "token rejected" (orange) | Click **Token...** and paste the token from the server terminal or `files/.bridge_token`. You never need to restart the server for this. |
+| Token keeps changing / "conflicts" | Only one copy of the extension should be loaded (check `chrome://extensions`). v0.5 never reads the token from a form field and only saves a token the server accepted. |
+| Two panels on the page | Two copies of the extension are loaded. Remove the old ones; the newest version wins and the rest shut down. |
+| Autopilot keeps sending after "Reset" | The old Reset re-armed autopilot. Use **End task**: it stops everything until you start again. |
+| It ran an old tool call when I opened another chat | Fixed in v0.5: history is baselined on every chat switch. Reload the extension and the tab. |
+| Nothing happens after a tool block | Server not running, extension not reloaded, or DeepSeek changed its page (update `CFG.assistantMsg` / `CFG.input`). Press **Copy log**. |
 | "input box not found" | DeepSeek changed its page: update `CFG.input`. |
 | "DeepSeek says slow down - retry n/6" | Normal. It backs off and retries the same message; the gap grows by itself. |
 | "waiting for DeepSeek to finish" for a long time | Generating-detection is wrong for the current page. **Copy log** and check `generating=`. |
-| "chat is full - start a NEW chat" | DeepSeek's conversation length limit. Open a new chat and click **Insert protocol**. |
-| "waiting for YOUR approval (popup)" | A confirm dialog is open (it may be in another window). |
+| "waiting - you are typing" | You have text in the chat box. Send it or clear it; autopilot never overwrites a draft. |
+| "chat is full - start a NEW chat" | DeepSeek's length limit was hit. Open a new chat and click **Insert protocol**. Keep **auto-handoff** on to avoid this. |
+| "handoff saved - opening a new chat" | Normal. Press Enter in the new chat to continue. |
+| "waiting for YOUR approval" | An approval card is open in the panel (the tab title shows "Approve?" if the tab is hidden). |
 | "could not send after several retries" | DeepSeek kept refusing. The message is in the box; press Enter when ready. |
-| "stopped: the model keeps trying blocked actions" | The sandbox refused 3 times. Read the reply. If the action is legitimate, allow the folder with `BRIDGE_WRITE_ALLOW`, then press **Reset**. |
+| "stopped: the model keeps trying blocked actions" | The sandbox refused 3 times. Read the reply. If the action is legitimate, allow the folder with `BRIDGE_WRITE_ALLOW`, then start the next task. |
 | "blocked by bridge policy" / "Permission denied" writing outside the project | Intended (sandbox). Use `BRIDGE_WRITE_ALLOW=/path` for a folder you trust. |
 | "path is outside workspace root" | The AI used a path outside `BRIDGE_ROOT`. Change the root or set `BRIDGE_ALLOW_OUTSIDE=1` (not recommended). |
 | "blocked by denylist" | The command matched a dangerous pattern. Run it yourself if you really mean it. |
@@ -569,9 +673,8 @@ Settings in `extension/content.js` (the `CFG` object):
 - It automates a chat page rather than using an official tool-calling API. If you
   have API access, native function calling is the more robust route.
 - DeepSeek's real message-rate and conversation-length limits are undocumented.
-  The pacing is conservative and self-correcting, but cannot be guaranteed.
-- Long tasks fill the chat: each tool result adds to the conversation, and DeepSeek
-  has a length limit. Start a new chat for a new task.
+  The pacing and the hand-off threshold are conservative and self-correcting, but cannot be guaranteed.
+- Tool results are text only (no images, no live streaming of command output; use `start_process` plus `read_process_output` for long jobs).
 - The kernel shell sandbox is Linux-only (Landlock); reads and network are not
   restricted. See [What does NOT protect you](#what-does-not-protect-you).
 - Check DeepSeek's terms of service regarding automated use of the web chat.
@@ -584,7 +687,8 @@ Settings in `extension/content.js` (the `CFG` object):
 | 0.3 | Send gate with minimum gap, verified sends with backoff/retry, batching (up to 5 calls per reply), duplicate-instance guard, one timer loop. |
 | 0.3.1 | Stall watchdog, "Copy log", timeouts on every background call, several JSON objects per code block, context gauge. |
 | 0.4 | Kernel shell sandbox + command policy (`bridge_guard.py`), cache fixes (20 s, exact key, `fresh`), safer read-only detection, stop after repeated blocked attempts, credential files never read. |
+| 0.5 | **End task** that really stops everything; chat switches never replay old tool calls or continue a task; token validated before saving (no more autofill/stale-copy conflicts) and one active extension copy per page; approval cards; 17 tools (search, read-many, move, process management, per-call timeouts); `/cancel`, `/ping`; stdin closed for commands; project instructions; automatic hand-off to a fresh chat; your own messages and drafts are never overwritten; activity list; `start_bridge.sh`. |
 
 ## License
 
-MIT license
+Add your preferred license here (for example MIT).

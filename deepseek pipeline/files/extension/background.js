@@ -1,6 +1,8 @@
-// Background worker for the DeepSeek Local Bridge.
+// Background worker for the DeepSeek Local Bridge (v0.5).
 //  1. "bridge": relays calls from the page's content script to the local bridge server.
 //     Doing the fetch here (not in the page) avoids CORS / private-network issues.
+//     - msg.token   : use THIS token instead of the saved one (used to validate a token before saving it)
+//     - msg.timeoutMs: abort the request after this long (default 120 s) so nothing can hang forever
 //  2. "gate": ONE shared send gate for every DeepSeek tab/instance. It guarantees
 //     - only one sender at a time (a lease that expires, so a crashed tab can't block forever)
 //     - a minimum gap between any two messages, which grows when DeepSeek says "too frequent"
@@ -76,18 +78,24 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type !== "bridge") return;
 
   chrome.storage.local.get(["token", "port"]).then(async ({ token, port }) => {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), msg.timeoutMs || 120000);
     try {
       const r = await fetch(`http://127.0.0.1:${port || 8765}${msg.path}`, {
         method: "POST",
+        signal: ctl.signal,
         headers: {
           "Content-Type": "application/json",
-          "X-Bridge-Token": token || "",
+          "X-Bridge-Token": (msg.token !== undefined ? msg.token : token) || "",
         },
         body: JSON.stringify(msg.body || {}),
       });
-      sendResponse({ ok: r.ok, data: await r.json() });
+      sendResponse({ ok: r.ok, status: r.status, data: await r.json() });
     } catch (e) {
-      sendResponse({ ok: false, data: { error: String(e) } });
+      const why = e && e.name === "AbortError" ? "request timed out" : String(e);
+      sendResponse({ ok: false, status: 0, data: { error: why } });
+    } finally {
+      clearTimeout(timer);
     }
   });
 

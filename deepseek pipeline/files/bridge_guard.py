@@ -39,7 +39,9 @@ def _libc():
 
 
 def landlock_abi():
-    """Landlock ABI version supported by this kernel, 0 if unavailable."""
+    """Landlock ABI version supported by this kernel, 0 if unavailable (always 0 off Linux)."""
+    if not sys.platform.startswith("linux"):
+        return 0
     try:
         r = _libc().syscall(_SYS_CREATE, None, ctypes.c_size_t(0), ctypes.c_uint32(1))
         return int(r) if r > 0 else 0
@@ -112,12 +114,16 @@ def launcher_argv(write_dirs, cmd, require_landlock=False):
 def _launcher_main(argv):
     cfg = json.loads(argv[0])
     cmd = argv[1]
-    nnp, ll = apply_kernel_limits(cfg["write_dirs"])
-    if not nnp:
-        sys.stderr.write("bridge sandbox: could not set no_new_privs - refusing to run\n")
-        os._exit(126)
-    if ll == "failed" or (cfg.get("require") and ll != "enforced"):
-        sys.stderr.write("bridge sandbox: Landlock not enforced (%s) - refusing to run\n" % ll)
+    if sys.platform.startswith("linux"):
+        nnp, ll = apply_kernel_limits(cfg["write_dirs"])
+        if not nnp:
+            sys.stderr.write("bridge sandbox: could not set no_new_privs - refusing to run\n")
+            os._exit(126)
+        if ll == "failed" or (cfg.get("require") and ll != "enforced"):
+            sys.stderr.write("bridge sandbox: Landlock not enforced (%s) - refusing to run\n" % ll)
+            os._exit(126)
+    elif cfg.get("require"):
+        sys.stderr.write("bridge sandbox: the kernel sandbox needs Linux - refusing to run\n")
         os._exit(126)
     os.execv("/bin/bash", ["bash", "-c", cmd])
 
